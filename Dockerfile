@@ -25,13 +25,18 @@ RUN apt-get update \
 
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
-ENV GRADLE_VERSION=8.7
-RUN curl -fsSL https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -o /tmp/gradle.zip \
-  && unzip -q /tmp/gradle.zip -d /opt \
-  && ln -s /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle \
-  && rm /tmp/gradle.zip
+ENV GRADLE_8_VERSION=8.7
+ENV GRADLE_9_VERSION=9.1.0
+RUN curl -fsSL https://services.gradle.org/distributions/gradle-${GRADLE_8_VERSION}-bin.zip -o /tmp/gradle-8.zip \
+  && curl -fsSL https://services.gradle.org/distributions/gradle-${GRADLE_9_VERSION}-bin.zip -o /tmp/gradle-9.zip \
+  && unzip -q /tmp/gradle-8.zip -d /opt \
+  && unzip -q /tmp/gradle-9.zip -d /opt \
+  && ln -s /opt/gradle-${GRADLE_8_VERSION}/bin/gradle /usr/local/bin/gradle \
+  && rm /tmp/gradle-8.zip /tmp/gradle-9.zip
 
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
+ENV ANDROID_NDK_VERSION=21.4.7075529
+ENV ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}
 
 RUN mkdir -p ${ANDROID_SDK_ROOT}/cmdline-tools \
   && curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip -o /tmp/android-tools.zip \
@@ -46,11 +51,15 @@ RUN mkdir -p /root/.android \
   && yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} --licenses \
   && sdkmanager --sdk_root=${ANDROID_SDK_ROOT} \
     "platform-tools" \
+    "platforms;android-36" "build-tools;36.0.0" \
+    "platforms;android-35" "build-tools;35.0.0" \
     "platforms;android-34" "build-tools;34.0.0" \
     "platforms;android-33" "build-tools;33.0.2" \
     "platforms;android-32" "build-tools;32.0.0" \
     "platforms;android-31" "build-tools;31.0.0" \
-    "platforms;android-30" "build-tools;30.0.3"
+    "platforms;android-30" "build-tools;30.0.3" \
+    "ndk;21.4.7075529" "ndk;28.2.13676358" \
+    "cmake;3.22.1"
 
 WORKDIR /app
 

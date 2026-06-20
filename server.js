@@ -15,6 +15,8 @@ const distDir = path.join(__dirname, "dist");
 const artifactRoot = path.join(os.tmpdir(), "apk-forge-artifacts");
 
 const WEB_BUILD_OUTPUT_DIRS = ["dist", "build", "out", "public"];
+const DEFAULT_COMMAND_TIMEOUT_MS = 45 * 60 * 1000;
+const BUILD_HEARTBEAT_MS = 30 * 1000;
 
 await fs.mkdir(artifactRoot, { recursive: true });
 
@@ -300,7 +302,16 @@ async function resolveGradleCommand(androidRoot) {
   const gradlew = path.join(androidRoot, "gradlew");
   if (await pathExists(gradlew)) {
     await fs.chmod(gradlew, 0o755);
-    return { command: "./gradlew", argsPrefix: [] };
+    return { command: "./gradlew", argsPrefix: ["--no-daemon"] };
+  }
+
+  const pluginVersion = await detectAndroidGradlePluginVersion(androidRoot);
+  if (compareMajor(pluginVersion, 9) && (await pathExists("/opt/gradle-9.1.0/bin/gradle"))) {
+    return { command: "/opt/gradle-9.1.0/bin/gradle", argsPrefix: ["--no-daemon"] };
+  }
+
+  if (await pathExists("/opt/gradle-8.7/bin/gradle")) {
+    return { command: "/opt/gradle-8.7/bin/gradle", argsPrefix: ["--no-daemon"] };
   }
 
   return { command: "gradle", argsPrefix: ["--no-daemon"] };
@@ -355,17 +366,48 @@ function attachStreamLogger(stream, job) {
 
 function runCommand(command, args, options, job) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let lastOutputAt = Date.now();
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    const markOutput = () => {
+      lastOutputAt = Date.now();
+    };
+    child.stdout.on("data", markOutput);
+    child.stderr.on("data", markOutput);
     attachStreamLogger(child.stdout, job);
     attachStreamLogger(child.stderr, job);
 
-    child.on("error", reject);
+    const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const timeout = windowlessSetTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      pushLog(job, `${command} exceeded ${Math.round(timeoutMs / 60000)} minutes and was stopped.`);
+      child.kill("SIGTERM");
+      windowlessSetTimeout(() => child.kill("SIGKILL"), 5000);
+    }, timeoutMs);
+
+    const heartbeat = windowlessSetInterval(() => {
+      const quietForSeconds = Math.round((Date.now() - lastOutputAt) / 1000);
+      pushLog(job, `${command} is still running; no output for ${quietForSeconds}s.`);
+    }, BUILD_HEARTBEAT_MS);
+
+    child.on("error", (error) => {
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
+      reject(error);
+    });
     child.on("close", (code) => {
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
       if (code === 0) {
         resolve(undefined);
         return;
@@ -376,11 +418,59 @@ function runCommand(command, args, options, job) {
   });
 }
 
+const windowlessSetTimeout = globalThis.setTimeout;
+const windowlessSetInterval = globalThis.setInterval;
+
 async function cleanupDirectory(directory) {
   try {
     await fs.rm(directory, { recursive: true, force: true });
   } catch {
     // Ignore cleanup failures.
+  }
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function detectAndroidGradlePluginVersion(androidRoot) {
+  const buildFiles = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"];
+  for (const buildFile of buildFiles) {
+    const contents = await readTextIfExists(path.join(androidRoot, buildFile));
+    const match = contents.match(/com\.android(?:\.application|\.library|\.test)?[^\n\r]*version[ '\"]+([0-9]+(?:\.[0-9]+){1,2})/) || contents.match(/com\.android\.tools\.build:gradle:\$?\{?([0-9]+(?:\.[0-9]+){1,2})/) || contents.match(/android_plugin_version\s*=\s*['\"]([0-9]+(?:\.[0-9]+){1,2})/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function compareMajor(version, major) {
+  return Number.parseInt(String(version || "0").split(".")[0] || "0", 10) >= major;
+}
+
+async function writeLocalProperties(androidRoot) {
+  const lines = [];
+  if (process.env.ANDROID_SDK_ROOT) {
+    lines.push(`sdk.dir=${process.env.ANDROID_SDK_ROOT}`);
+  }
+
+  if (process.env.ANDROID_NDK_HOME) {
+    lines.push(`ndk.dir=${process.env.ANDROID_NDK_HOME}`);
+    lines.push(`android.ndkPath=${process.env.ANDROID_NDK_HOME}`);
+  }
+
+  if (process.env.ANDROID_NDK_VERSION) {
+    lines.push(`android.ndkFullVersion=${process.env.ANDROID_NDK_VERSION}`);
+  }
+
+  if (lines.length > 0) {
+    await fs.writeFile(path.join(androidRoot, "local.properties"), `${lines.join("\n")}\n`);
   }
 }
 
@@ -393,7 +483,7 @@ async function runBuild(job) {
     pushLog(job, "Cloning GitHub repository into an isolated workspace.");
 
     const cloneUrl = buildCloneUrl(job.repoUrl, job.token || "");
-    const cloneArgs = ["clone", "--depth", "1"];
+    const cloneArgs = ["clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules"];
     if (job.branch) {
       cloneArgs.push("--branch", job.branch);
     }
@@ -413,12 +503,17 @@ async function runBuild(job) {
       pushLog(job, "Generated a minimal Android WebView wrapper for the web app.");
     }
 
+    await writeLocalProperties(androidRoot);
     const gradleCommand = await resolveGradleCommand(androidRoot);
 
     setJob(job, { status: "building", stage: "Running Android build", progress: 68 });
     pushLog(job, `Executing ${gradleCommand.command} assembleDebug to generate the APK artifact.`);
 
     const gradleEnv = {
+      ANDROID_HOME: process.env.ANDROID_SDK_ROOT,
+      ANDROID_SDK_ROOT: process.env.ANDROID_SDK_ROOT,
+      ANDROID_NDK_HOME: process.env.ANDROID_NDK_HOME,
+      ANDROID_NDK_ROOT: process.env.ANDROID_NDK_HOME,
       GRADLE_USER_HOME: path.join(workspace, ".gradle"),
     };
     if (process.env.JAVA_HOME) {
