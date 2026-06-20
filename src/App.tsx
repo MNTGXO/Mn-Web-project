@@ -36,7 +36,7 @@ const initialJob: BuildJob = {
   privateRepo: false,
   logs: [
     "Awaiting a GitHub repository link.",
-    "The build worker will clone, inspect, and compile the Android project.",
+    "The build worker will clone, inspect, and compile Android projects or wrap web apps in a WebView APK.",
     "Private repositories can be unlocked with a token and never stored.",
   ],
   updatedAt: new Date().toISOString(),
@@ -45,8 +45,8 @@ const initialJob: BuildJob = {
 const demoLines = [
   "// apk-forge worker online",
   "$ clone github.com/owner/repo --depth 1",
-  "$ detect Android project root",
-  "$ ./gradlew assembleDebug",
+  "$ detect Android, React/Vite, static, or other web root",
+  "$ build native project or generate WebView wrapper",
   "$ package output as installable APK",
 ];
 
@@ -181,7 +181,7 @@ export default function App() {
         <section className="relative mx-auto flex min-h-screen w-full max-w-7xl flex-col px-6 py-6 lg:px-10">
           <header className="flex items-center justify-between gap-4 text-[10px] uppercase tracking-[0.4em] text-white/45">
             <div className="font-semibold tracking-[0.6em] text-white/80">APK FORGE</div>
-            <div className="hidden text-right md:block">GitHub repo to APK pipeline for public and private repos</div>
+            <div className="hidden text-right md:block">GitHub repo to APK pipeline with Android and web-app fallback support</div>
           </header>
 
           <div className="grid flex-1 items-center gap-12 py-12 lg:grid-cols-[1.04fr_0.96fr] lg:py-16">
@@ -194,11 +194,11 @@ export default function App() {
               >
                 <p className="text-sm uppercase tracking-[0.35em] text-cyan-200/70">Android build automation</p>
                 <h1 className="max-w-xl text-5xl font-semibold tracking-tight text-white sm:text-6xl lg:text-7xl">
-                  Paste a GitHub repo. Ship an APK.
+                  Paste almost any repo. Ship an APK.
                 </h1>
                 <p className="max-w-xl text-base leading-7 text-slate-300 sm:text-lg">
                   Drop in a repository URL, add a token for private sources, and let the worker clone,
-                  inspect, and assemble the Android project into a downloadable APK.
+                  inspect it, then either assemble the Android project or wrap a packageable web app into a downloadable APK.
                 </p>
               </motion.div>
 
@@ -346,8 +346,7 @@ export default function App() {
                           <div>
                             <p className="text-4xl font-semibold tracking-tight text-white">1 build</p>
                             <p className="mt-2 max-w-40 text-sm leading-6 text-slate-400">
-                              The worker can emit a signed or debug APK once the Android project is
-                              detected.
+                              The worker emits a debug APK after compiling a native Android project or generating a WebView wrapper for a web app.
                             </p>
                           </div>
                           <motion.div
@@ -413,19 +412,19 @@ export default function App() {
             <div className="space-y-4">
               <p className="text-sm uppercase tracking-[0.35em] text-white/40">How it works</p>
               <h2 className="max-w-sm text-3xl font-semibold tracking-tight text-white sm:text-4xl">
-                One request, one workspace, one APK.
+                One request, one workspace, one APK from Android or web sources.
               </h2>
               <p className="max-w-md text-base leading-7 text-slate-400">
                 The site keeps the flow sharp: enter the repo, unlock private access if needed, and let
-                the worker drive the Android build from start to finish.
+                the worker drive native Android builds or generated web wrappers from start to finish.
               </p>
             </div>
 
             <div className="grid gap-6 sm:grid-cols-3">
               {[
                 ["01", "Clone", "Normalize the repo URL, attach the token only for private access, and clone in isolation."],
-                ["02", "Inspect", "Find the Android root, verify the Gradle wrapper, and prepare the build task."],
-                ["03", "Package", "Run the Gradle build and expose the APK artifact for download."],
+                ["02", "Inspect", "Find an Android root, or detect a packageable web app and generate a WebView Android wrapper."],
+                ["03", "Package", "Run the Android build and expose the APK artifact for download."],
               ].map(([index, title, copy]) => (
                 <div key={title} className="space-y-3 border-t border-white/10 pt-4">
                   <p className="text-xs uppercase tracking-[0.35em] text-cyan-200/70">{index}</p>
@@ -442,7 +441,7 @@ export default function App() {
               <h2 className="text-3xl font-semibold tracking-tight text-white">Runs as a single container.</h2>
               <p className="max-w-xl text-base leading-7 text-slate-400">
                 The Docker image builds the React frontend, ships the API server, and includes the Android
-                toolchain needed for repo analysis and APK assembly. It listens on the Koyeb PORT value so
+                toolchain needed for repo analysis, web packaging, and APK assembly. It listens on the Koyeb PORT value so
                 deployment stays plug-and-play.
               </p>
             </div>

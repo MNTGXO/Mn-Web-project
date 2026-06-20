@@ -20,9 +20,16 @@ RUN apt-get update \
     git \
     openjdk-17-jdk \
     unzip \
+    zip \
   && rm -rf /var/lib/apt/lists/*
 
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+ENV GRADLE_VERSION=8.7
+RUN curl -fsSL https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -o /tmp/gradle.zip \
+  && unzip -q /tmp/gradle.zip -d /opt \
+  && ln -s /opt/gradle-${GRADLE_VERSION}/bin/gradle /usr/local/bin/gradle \
+  && rm /tmp/gradle.zip
 
 ENV ANDROID_SDK_ROOT=/opt/android-sdk
 
