@@ -14,6 +14,10 @@ const port = Number(process.env.PORT || 8080);
 const distDir = path.join(__dirname, "dist");
 const artifactRoot = path.join(os.tmpdir(), "apk-forge-artifacts");
 
+const WEB_BUILD_OUTPUT_DIRS = ["dist", "build", "out", "public"];
+const DEFAULT_COMMAND_TIMEOUT_MS = 45 * 60 * 1000;
+const BUILD_HEARTBEAT_MS = 30 * 1000;
+
 await fs.mkdir(artifactRoot, { recursive: true });
 
 app.use(express.json({ limit: "1mb" }));
@@ -129,7 +133,7 @@ async function findAndroidRoot(startDir) {
     }
 
     const names = new Set(entries.map((entry) => entry.name));
-    const isCandidate = names.has("gradlew") && (names.has("settings.gradle") || names.has("settings.gradle.kts"));
+    const isCandidate = (names.has("settings.gradle") || names.has("settings.gradle.kts")) && (names.has("build.gradle") || names.has("build.gradle.kts"));
     if (isCandidate) {
       return current.dir;
     }
@@ -146,6 +150,171 @@ async function findAndroidRoot(startDir) {
   }
 
   return null;
+}
+
+async function findWebRoot(startDir) {
+  const queue = [{ dir: startDir, depth: 0 }];
+  const ignored = new Set([".git", "node_modules", "build", "dist", ".gradle", "android", "ios"]);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    let entries;
+    try {
+      entries = await fs.readdir(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    const names = new Set(entries.map((entry) => entry.name));
+    if (names.has("package.json") || names.has("index.html")) {
+      return current.dir;
+    }
+
+    if (current.depth >= 3) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (entry.isDirectory() && !ignored.has(entry.name)) {
+        queue.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+      }
+    }
+  }
+
+  return null;
+}
+
+async function readJson(filePath) {
+  const text = await fs.readFile(filePath, "utf8");
+  return JSON.parse(text);
+}
+
+async function copyDirectory(source, destination) {
+  await fs.mkdir(destination, { recursive: true });
+  const entries = await fs.readdir(source, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    if (entry.isDirectory()) {
+      await copyDirectory(from, to);
+    } else if (entry.isFile()) {
+      await fs.copyFile(from, to);
+    }
+  }
+}
+
+async function detectWebOutput(webRoot) {
+  for (const outputDir of WEB_BUILD_OUTPUT_DIRS) {
+    const candidate = path.join(webRoot, outputDir);
+    if (await pathExists(path.join(candidate, "index.html"))) {
+      return candidate;
+    }
+  }
+
+  if (await pathExists(path.join(webRoot, "index.html"))) {
+    return webRoot;
+  }
+
+  return null;
+}
+
+async function prepareWebAssets(webRoot, workspace, job) {
+  const packageJsonPath = path.join(webRoot, "package.json");
+  if (await pathExists(packageJsonPath)) {
+    const packageJson = await readJson(packageJsonPath);
+    if (await pathExists(path.join(webRoot, "package-lock.json"))) {
+      pushLog(job, "Installing web dependencies with npm ci.");
+      await runCommand("npm", ["ci"], { cwd: webRoot }, job);
+    } else {
+      pushLog(job, "Installing web dependencies with npm install.");
+      await runCommand("npm", ["install"], { cwd: webRoot }, job);
+    }
+
+    if (packageJson.scripts?.build) {
+      pushLog(job, "Building web application with npm run build.");
+      await runCommand("npm", ["run", "build"], { cwd: webRoot }, job);
+    } else {
+      pushLog(job, "No build script found; packaging existing static web files.");
+    }
+  }
+
+  const webOutput = await detectWebOutput(webRoot);
+  if (!webOutput) {
+    throw new Error("No Android project or packageable web entrypoint was found. Add Gradle files, package.json, or index.html.");
+  }
+
+  const assetsDir = path.join(workspace, "generated-android", "app", "src", "main", "assets", "www");
+  await copyDirectory(webOutput, assetsDir);
+  return path.join(workspace, "generated-android");
+}
+
+function escapeXmlAttribute(value) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+async function writeGeneratedAndroidProject(androidRoot, appName) {
+  const safeName = appName.replace(/[^A-Za-z0-9 _-]/g, " ").trim() || "APK Forge App";
+  const label = escapeXmlAttribute(safeName);
+  const files = new Map([
+    ["settings.gradle", `pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = '${safeName.replace(/'/g, "")}Android'\ninclude ':app'\n`],
+    ["build.gradle", "plugins {\n    id 'com.android.application' version '8.5.2' apply false\n}\n"],
+    ["app/build.gradle", "plugins { id 'com.android.application' }\n\nandroid {\n    namespace 'com.apkforge.generated'\n    compileSdk 34\n\n    defaultConfig {\n        applicationId 'com.apkforge.generated'\n        minSdk 23\n        targetSdk 34\n        versionCode 1\n        versionName '1.0'\n    }\n}\n"],
+    ["app/src/main/AndroidManifest.xml", `<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application android:theme="@style/AppTheme" android:label="${label}">\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN" />\n                <category android:name="android.intent.category.LAUNCHER" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n`],
+    ["app/src/main/res/values/styles.xml", "<resources>\n    <style name=\"AppTheme\" parent=\"android:style/Theme.Material.Light.NoActionBar\">\n        <item name=\"android:windowLightStatusBar\">true</item>\n    </style>\n</resources>\n"],
+    ["app/src/main/java/com/apkforge/generated/MainActivity.java", "package com.apkforge.generated;\n\nimport android.app.Activity;\nimport android.os.Bundle;\nimport android.webkit.WebSettings;\nimport android.webkit.WebView;\n\npublic class MainActivity extends Activity {\n    @Override\n    protected void onCreate(Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        WebView webView = new WebView(this);\n        WebSettings settings = webView.getSettings();\n        settings.setJavaScriptEnabled(true);\n        settings.setDomStorageEnabled(true);\n        settings.setAllowFileAccess(true);\n        setContentView(webView);\n        webView.loadUrl(\"file:///android_asset/www/index.html\");\n    }\n}\n"],
+  ]);
+
+  for (const [relativePath, contents] of files) {
+    const target = path.join(androidRoot, relativePath);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, contents);
+  }
+}
+
+async function buildGeneratedAndroidProject(repoDir, workspace, job) {
+  const webRoot = await findWebRoot(repoDir);
+  if (!webRoot) {
+    throw new Error("No Android project or web app was found. Add Gradle files, package.json, or index.html.");
+  }
+
+  pushLog(job, `Web project detected at ${path.relative(repoDir, webRoot) || "."}`);
+  const androidRoot = await prepareWebAssets(webRoot, workspace, job);
+  let appName = path.basename(repoDir);
+  if (await pathExists(path.join(webRoot, "package.json"))) {
+    const packageJson = await readJson(path.join(webRoot, "package.json")).catch(() => null);
+    appName = packageJson?.name || appName;
+  }
+
+  await writeGeneratedAndroidProject(androidRoot, appName);
+  return androidRoot;
+}
+
+async function resolveGradleCommand(androidRoot) {
+  const gradlew = path.join(androidRoot, "gradlew");
+  if (await pathExists(gradlew)) {
+    await fs.chmod(gradlew, 0o755);
+    return { command: "./gradlew", argsPrefix: ["--no-daemon"] };
+  }
+
+  const pluginVersion = await detectAndroidGradlePluginVersion(androidRoot);
+  if (compareMajor(pluginVersion, 9) && (await pathExists("/opt/gradle-9.1.0/bin/gradle"))) {
+    return { command: "/opt/gradle-9.1.0/bin/gradle", argsPrefix: ["--no-daemon"] };
+  }
+
+  if (await pathExists("/opt/gradle-8.7/bin/gradle")) {
+    return { command: "/opt/gradle-8.7/bin/gradle", argsPrefix: ["--no-daemon"] };
+  }
+
+  return { command: "gradle", argsPrefix: ["--no-daemon"] };
 }
 
 async function findLatestApk(rootDir) {
@@ -197,17 +366,48 @@ function attachStreamLogger(stream, job) {
 
 function runCommand(command, args, options, job) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let lastOutputAt = Date.now();
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    const markOutput = () => {
+      lastOutputAt = Date.now();
+    };
+    child.stdout.on("data", markOutput);
+    child.stderr.on("data", markOutput);
     attachStreamLogger(child.stdout, job);
     attachStreamLogger(child.stderr, job);
 
-    child.on("error", reject);
+    const timeoutMs = options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    const timeout = windowlessSetTimeout(() => {
+      if (settled) {
+        return;
+      }
+
+      pushLog(job, `${command} exceeded ${Math.round(timeoutMs / 60000)} minutes and was stopped.`);
+      child.kill("SIGTERM");
+      windowlessSetTimeout(() => child.kill("SIGKILL"), 5000);
+    }, timeoutMs);
+
+    const heartbeat = windowlessSetInterval(() => {
+      const quietForSeconds = Math.round((Date.now() - lastOutputAt) / 1000);
+      pushLog(job, `${command} is still running; no output for ${quietForSeconds}s.`);
+    }, BUILD_HEARTBEAT_MS);
+
+    child.on("error", (error) => {
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
+      reject(error);
+    });
     child.on("close", (code) => {
+      settled = true;
+      clearTimeout(timeout);
+      clearInterval(heartbeat);
       if (code === 0) {
         resolve(undefined);
         return;
@@ -218,11 +418,59 @@ function runCommand(command, args, options, job) {
   });
 }
 
+const windowlessSetTimeout = globalThis.setTimeout;
+const windowlessSetInterval = globalThis.setInterval;
+
 async function cleanupDirectory(directory) {
   try {
     await fs.rm(directory, { recursive: true, force: true });
   } catch {
     // Ignore cleanup failures.
+  }
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function detectAndroidGradlePluginVersion(androidRoot) {
+  const buildFiles = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"];
+  for (const buildFile of buildFiles) {
+    const contents = await readTextIfExists(path.join(androidRoot, buildFile));
+    const match = contents.match(/com\.android(?:\.application|\.library|\.test)?[^\n\r]*version[ '\"]+([0-9]+(?:\.[0-9]+){1,2})/) || contents.match(/com\.android\.tools\.build:gradle:\$?\{?([0-9]+(?:\.[0-9]+){1,2})/) || contents.match(/android_plugin_version\s*=\s*['\"]([0-9]+(?:\.[0-9]+){1,2})/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function compareMajor(version, major) {
+  return Number.parseInt(String(version || "0").split(".")[0] || "0", 10) >= major;
+}
+
+async function writeLocalProperties(androidRoot) {
+  const lines = [];
+  if (process.env.ANDROID_SDK_ROOT) {
+    lines.push(`sdk.dir=${process.env.ANDROID_SDK_ROOT}`);
+  }
+
+  if (process.env.ANDROID_NDK_HOME) {
+    lines.push(`ndk.dir=${process.env.ANDROID_NDK_HOME}`);
+    lines.push(`android.ndkPath=${process.env.ANDROID_NDK_HOME}`);
+  }
+
+  if (process.env.ANDROID_NDK_VERSION) {
+    lines.push(`android.ndkFullVersion=${process.env.ANDROID_NDK_VERSION}`);
+  }
+
+  if (lines.length > 0) {
+    await fs.writeFile(path.join(androidRoot, "local.properties"), `${lines.join("\n")}\n`);
   }
 }
 
@@ -235,7 +483,7 @@ async function runBuild(job) {
     pushLog(job, "Cloning GitHub repository into an isolated workspace.");
 
     const cloneUrl = buildCloneUrl(job.repoUrl, job.token || "");
-    const cloneArgs = ["clone", "--depth", "1"];
+    const cloneArgs = ["clone", "--depth", "1", "--recurse-submodules", "--shallow-submodules"];
     if (job.branch) {
       cloneArgs.push("--branch", job.branch);
     }
@@ -243,34 +491,36 @@ async function runBuild(job) {
 
     await runCommand("git", cloneArgs, { cwd: workspace }, job);
 
-    setJob(job, { status: "analyzing", stage: "Inspecting Android structure", progress: 36 });
-    pushLog(job, "Searching for the Android project root and Gradle wrapper.");
+    setJob(job, { status: "analyzing", stage: "Inspecting repository structure", progress: 36 });
+    pushLog(job, "Searching for an Android project root or packageable web app.");
 
-    const androidRoot = await findAndroidRoot(repoDir);
-    if (!androidRoot) {
-      throw new Error("No Android project was found. The repository needs a Gradle Android app or module.");
+    let androidRoot = await findAndroidRoot(repoDir);
+    if (androidRoot) {
+      pushLog(job, `Android root detected at ${path.relative(repoDir, androidRoot) || "."}`);
+    } else {
+      pushLog(job, "No Gradle Android project found. Trying web-to-APK packaging fallback.");
+      androidRoot = await buildGeneratedAndroidProject(repoDir, workspace, job);
+      pushLog(job, "Generated a minimal Android WebView wrapper for the web app.");
     }
 
-    pushLog(job, `Android root detected at ${path.relative(repoDir, androidRoot) || "."}`);
+    await writeLocalProperties(androidRoot);
+    const gradleCommand = await resolveGradleCommand(androidRoot);
 
-    const gradlew = path.join(androidRoot, "gradlew");
-    if (!(await pathExists(gradlew))) {
-      throw new Error("The repository is missing gradlew. Add the Gradle wrapper for reliable APK builds.");
-    }
-
-    await fs.chmod(gradlew, 0o755);
-
-    setJob(job, { status: "building", stage: "Running Gradle build", progress: 68 });
-    pushLog(job, "Executing ./gradlew assembleDebug to generate the APK artifact.");
+    setJob(job, { status: "building", stage: "Running Android build", progress: 68 });
+    pushLog(job, `Executing ${gradleCommand.command} assembleDebug to generate the APK artifact.`);
 
     const gradleEnv = {
+      ANDROID_HOME: process.env.ANDROID_SDK_ROOT,
+      ANDROID_SDK_ROOT: process.env.ANDROID_SDK_ROOT,
+      ANDROID_NDK_HOME: process.env.ANDROID_NDK_HOME,
+      ANDROID_NDK_ROOT: process.env.ANDROID_NDK_HOME,
       GRADLE_USER_HOME: path.join(workspace, ".gradle"),
     };
     if (process.env.JAVA_HOME) {
       gradleEnv.JAVA_HOME = process.env.JAVA_HOME;
     }
 
-    await runCommand("./gradlew", ["assembleDebug", "-x", "test", "-x", "lint"], { cwd: androidRoot, env: gradleEnv }, job);
+    await runCommand(gradleCommand.command, [...gradleCommand.argsPrefix, "assembleDebug", "-x", "test", "-x", "lint"], { cwd: androidRoot, env: gradleEnv }, job);
 
     setJob(job, { status: "packaging", stage: "Packaging APK artifact", progress: 90 });
     pushLog(job, "Build finished. Locating the newest APK output.");
